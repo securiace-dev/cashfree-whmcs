@@ -1,87 +1,114 @@
 <?php
-// Require libraries needed for gateway module functions.
+/**
+ * Cashfree server-to-server notify / webhook handler.
+ *
+ * Supports:
+ * - Modern PG JSON webhooks (x-webhook-signature / x-webhook-timestamp)
+ * - Legacy form-encoded notify_url payloads (orderId + signature body field)
+ *
+ * Credits invoices only after signature verification, SUCCESS status,
+ * invoice validation, and amount match. Never force-marks invoices Unpaid.
+ */
+
 require_once __DIR__ . '/../../../init.php';
 require_once __DIR__ . '/../../../includes/gatewayfunctions.php';
 require_once __DIR__ . '/../../../includes/invoicefunctions.php';
+require_once __DIR__ . '/lib/CashfreeHelpers.php';
 
 use WHMCS\Database\Capsule;
 
 $gateway_module_name = 'cashfree';
+$gateway_params = getGatewayVariables($gateway_module_name);
 
-// Fetch gateway configuration parameters.
-$gateway_params  = getGatewayVariables($gateway_module_name);
-$secret_key      = $gateway_params["secretKey"];
-
-//Gateway response parameters
-$cashfree_order_id  = $_POST["orderId"];
-$invoice_id         = substr($cashfree_order_id, strpos($cashfree_order_id, "_") + 1);
-$transaction_id     = $_POST['referenceId'];
-
-$invoice_details = Capsule::table('tblinvoices')
-            ->where('id', $invoice_id)
-            ->first();
-//Execute notify url after 30 sec of execution return url
-// sleep(30);
-if($invoice_details->status === 'Paid')
-{
+if (empty($gateway_params['type'])) {
+    http_response_code(503);
+    echo 'Module Not Activated';
     exit;
 }
 
-$success = false;
-$error = "";
-
-try {
-    $data = "{$_POST['orderId']}{$_POST['orderAmount']}{$_POST['referenceId']}{$_POST['txStatus']}{$_POST['paymentMode']}{$_POST['txMsg']}{$_POST['txTime']}";
-    $hash_hmac = hash_hmac('sha256', $data, $secret_key, true) ;
-    $computed_signature = base64_encode($hash_hmac);
-    
-    if ($_POST["signature"] != $computed_signature)
-    {
-        $success = false;
-        $error = 'CASHFREE_ERROR:Invalid Signature';
-    }
-    else
-    {
-        $success = true;
-    }
-
-} catch (Exception $e) {
-    $success = false;
-    $error ="WHMCS_ERROR:Request to Cashfree Failed";
+$secret_key = isset($gateway_params['secretKey']) ? (string) $gateway_params['secretKey'] : '';
+$raw_body = file_get_contents('php://input');
+if ($raw_body === false) {
+    $raw_body = '';
 }
 
-/**
- * Check Callback Transaction ID.
- *
- * Performs a check for any existing transactions with the same given
- * transaction number.
- *
- * Performs a die upon encountering a duplicate.
+$parsed = cashfree_parse_webhook_event($raw_body, $_POST, $_SERVER, $secret_key);
+if (!$parsed['ok']) {
+    logTransaction($gateway_params['name'], array(
+        'error' => $parsed['error'],
+        'content_type' => isset($_SERVER['CONTENT_TYPE']) ? $_SERVER['CONTENT_TYPE'] : '',
+    ), 'Webhook rejected');
+    http_response_code(400);
+    echo 'Invalid webhook';
+    exit;
+}
 
- * @param string $transaction_id
- */
+$event = $parsed['event'];
 
+if (empty($event['is_success'])) {
+    logTransaction($gateway_params['name'], array(
+        'order_id' => $event['order_id'],
+        'payment_status' => $event['payment_status'],
+        'raw_type' => $event['raw_type'],
+        'format' => $event['format'],
+    ), 'Webhook ignored — payment not successful');
+    http_response_code(200);
+    echo 'OK';
+    exit;
+}
+
+$invoice_id = cashfree_extract_invoice_id($event['order_id']);
+if ($invoice_id === null) {
+    logTransaction($gateway_params['name'], $event, 'Webhook rejected — invalid order id');
+    http_response_code(400);
+    echo 'Invalid order id';
+    exit;
+}
+
+$invoice_id = checkCbInvoiceID($invoice_id, $gateway_params['name']);
+
+$invoice_details = Capsule::table('tblinvoices')->where('id', $invoice_id)->first();
+if (!$invoice_details) {
+    logTransaction($gateway_params['name'], $event, 'Webhook rejected — invoice not found');
+    http_response_code(404);
+    echo 'Invoice not found';
+    exit;
+}
+
+if ($invoice_details->status === 'Paid') {
+    http_response_code(200);
+    echo 'OK';
+    exit;
+}
+
+if (!cashfree_amounts_match($invoice_details->total, $event['amount'])) {
+    logTransaction($gateway_params['name'], array(
+        'event' => $event,
+        'invoice_total' => $invoice_details->total,
+    ), 'Webhook rejected — amount mismatch');
+    http_response_code(400);
+    echo 'Amount mismatch';
+    exit;
+}
+
+$transaction_id = (string) $event['transaction_id'];
 checkCbTransID($transaction_id);
 
-$amount = $invoice_details->total;
+addInvoicePayment(
+    $invoice_id,
+    $transaction_id,
+    $invoice_details->total,
+    0,
+    $gateway_module_name
+);
 
-# Apply Payment to Invoice: invoice_id, transaction_id, amount paid, fees, modulename
-if ($success === true)
-{
-    # Successful
-    addInvoicePayment($invoice_id, $transaction_id, $amount, 0, $gateway_params["name"]);
-    # Save to Gateway Log: name, data array, status
-    logTransaction($gateway_params["name"], $_POST, "Webhook successfully executed.");
-}
-else
-{
-    # Unsuccessful
-    Capsule::table('tblinvoices')
-        ->where('id', $invoice_id)
-        ->update(array(
-            'status' => 'Unpaid'
-        ));
-    # Save to Gateway Log: name, data array, status
-    logTransaction($gateway_params["name"], $_POST, "Webhook successfully execute with Error - ".$error . ". Please check cashfree dashboard for order id: ".$cashfree_order_id);
-}
+logTransaction($gateway_params['name'], array(
+    'order_id' => $event['order_id'],
+    'transaction_id' => $transaction_id,
+    'format' => $event['format'],
+    'payment_status' => $event['payment_status'],
+), 'Webhook payment applied');
+
+http_response_code(200);
+echo 'OK';
 exit;

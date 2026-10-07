@@ -1,13 +1,16 @@
 <?php
-define('CASHFREE_PLUGIN_VERSION', '2.4.2', true);
+define('CASHFREE_PLUGIN_VERSION', '2.4.3', true);
 define('API_VERSION', '2022-09-01');
+
+require_once __DIR__ . '/cashfree/lib/CashfreeHelpers.php';
 
 /**
  * WHMCS Cashfree Payment Gateway Module
  */
-if (!defined("WHMCS")) {
-    die("This file cannot be accessed directly");
+if (!defined('WHMCS')) {
+    die('This file cannot be accessed directly');
 }
+
 /**
  * Define module related meta data.
  * @return array
@@ -15,12 +18,14 @@ if (!defined("WHMCS")) {
 function cashfree_MetaData()
 {
     return array(
-        'DisplayName'               => 'Cashfree',
-        'APIVersion'                => CASHFREE_PLUGIN_VERSION,
-        'DisableLocalCredtCardInput'=> true,
-        'TokenisedStorage'          => false,
+        'DisplayName' => 'Cashfree',
+        // WHMCS gateway module API version (not the plugin release version).
+        'APIVersion' => '1.1',
+        'DisableLocalCreditCardInput' => true,
+        'TokenisedStorage' => false,
     );
 }
+
 /**
  * Define Cashfree gateway configuration options.
  * @return array
@@ -29,20 +34,20 @@ function cashfree_config()
 {
     return array(
         'FriendlyName' => array(
-            'Type'  => 'System',
+            'Type' => 'System',
             'Value' => 'Cashfree',
         ),
         'appId' => array(
-            'FriendlyName'  => 'App Id',
-            'Type'          => 'text',
-            'Size'          => '50',
-            'Description'   => 'Cashfree "App Id". Available <a href="https://www.cashfree.com/" target="_blank" style="bottom-border:1px dotted;">HERE</a>',
+            'FriendlyName' => 'App Id',
+            'Type' => 'text',
+            'Size' => '50',
+            'Description' => 'Cashfree "App Id". Available <a href="https://www.cashfree.com/" target="_blank">HERE</a>',
         ),
         'secretKey' => array(
-            'FriendlyName'  => 'Secret Key',
-            'Type'          => 'password',
-            'Size'          => '50',
-            'Description'   => 'Cashfree "Secret Key" shared during activation API Key',
+            'FriendlyName' => 'Secret Key',
+            'Type' => 'password',
+            'Size' => '50',
+            'Description' => 'Cashfree "Secret Key" from the Merchant Dashboard API Keys page',
         ),
         'themeLogo' => array(
             'FriendlyName' => 'Logo URL',
@@ -55,7 +60,7 @@ function cashfree_config()
             'Type' => 'text',
             'Size' => '15',
             'Default' => '#15A4D3',
-            'Description' => 'The colour of checkout form elements',
+            'Description' => 'Reserved for future checkout theming',
         ),
         'testMode' => array(
             'FriendlyName' => 'Test Mode',
@@ -69,204 +74,234 @@ function cashfree_config()
         ),
     );
 }
+
 /**
- * Payment link.
- * Required by third party payment gateway modules only.
- * Defines the HTML output displayed on an invoice. Typically consists of an
- * HTML form that will take the user to the payment gateway endpoint.
+ * Payment link HTML for the invoice.
+ *
  * @param array $params Payment Gateway Module Parameters
  * @return string
  */
 function cashfree_link($params)
 {
     $invoice_id = $params['invoiceid'];
-
-    $system_url = $params['systemurl'];
+    $system_url = rtrim($params['systemurl'], '/') . '/';
     $module_name = $params['paymentmethod'];
-    $invoice_details = mysql_fetch_assoc(select_query('tblinvoices', '*', array("id" => $invoice_id)));
 
-    if ($invoice_details['status'] === 'Paid') {
-        header("Location: " . $system_url . "/viewinvoice.php?id=" . $invoice_id);
-        exit;
+    if (isset($params['amount']) && (float) $params['amount'] <= 0) {
+        return '<p>Unable to pay a zero-amount invoice through Cashfree.</p>';
+    }
+
+    // Prefer Capsule when available (WHMCS 7+); avoid deprecated mysql_* APIs.
+    if (class_exists('WHMCS\\Database\\Capsule')) {
+        $paid = \WHMCS\Database\Capsule::table('tblinvoices')
+            ->where('id', $invoice_id)
+            ->where('status', 'Paid')
+            ->exists();
+        if ($paid) {
+            return '<p>This invoice is already paid.</p>';
+        }
     }
 
     $cf_request = array(
         'orderId' => 'cf' . time() . '_' . $invoice_id,
         'returnUrl' => $system_url . 'modules/gateways/cashfree/' . $module_name . '.php?order_id={order_id}',
         'notifyUrl' => $system_url . 'modules/gateways/cashfree/' . $module_name . '_notify.php',
-        'mode' => ($params['testMode'] == 'on') ? 'sandbox' : 'production'
+        'mode' => ($params['testMode'] == 'on') ? 'sandbox' : 'production',
     );
-    $mode = $cf_request['mode'];
+
     $callback_url = $system_url . 'modules/gateways/cashfree/' . $module_name . '.php?order_id=' . $cf_request['orderId'];
     $payment_session_id = generatePaymentSession($cf_request, $params);
 
-    $checkout_function = $params['checkoutPopUp'] == 'on' ? "openCheckout()" : "cashfree.checkout({paymentSessionId: '$payment_session_id', platformName: 'wh'})";
+    if ($payment_session_id === null || $payment_session_id === '') {
+        return '<p>Unable to create your order. Please contact support.</p>';
+    }
 
-    $html_output = generateHtmlOutput($cf_request, $payment_session_id, $callback_url, $checkout_function);
-
-    return $html_output;
+    $use_popup = (!empty($params['checkoutPopUp']) && $params['checkoutPopUp'] == 'on');
+    return generateHtmlOutput($cf_request, $payment_session_id, $callback_url, $use_popup);
 }
 
-function generateHtmlOutput($cf_request, $payment_session_id, $callback_url, $checkout_function)
+/**
+ * Build invoice-embedded checkout controls (fragment, not a full HTML document).
+ *
+ * @param array $cf_request
+ * @param string $payment_session_id
+ * @param string $callback_url
+ * @param bool $use_popup
+ * @return string
+ */
+function generateHtmlOutput($cf_request, $payment_session_id, $callback_url, $use_popup)
 {
-    $mode = $cf_request['mode'];
-    $isPaymentFailed = !empty($_GET["paymentfailed"]) && !empty($_GET["id"]);
-    $domContentLoadedScript = !$isPaymentFailed ? <<<EOT
-        document.addEventListener("DOMContentLoaded", function() {
-            $checkout_function;
-        });
-    EOT : '';
+    $mode = cashfree_js_string($cf_request['mode']);
+    $session = cashfree_js_string($payment_session_id);
+    $callback = cashfree_js_string($callback_url);
+    $popup_js = $use_popup ? 'true' : 'false';
 
     return <<<EOT
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
-        </head>
-        <body>
-            <form action="javascript:void(0);"></form>
-            <button type="button" id="renderBtn">Pay Now</button>
-        </body>
-        <script>
-            const cashfree = Cashfree({mode: "$mode"});
-            function openCheckout(){
-                cashfree.checkout({
-                    paymentSessionId: "$payment_session_id",
-                    redirectTarget: "_modal",
-                    platformName: "wh"
-                }).then((result) => {
-                    window.location.href = "$callback_url";
-                });
-            }
-            document.getElementById("renderBtn").addEventListener("click", () => {
-                $checkout_function;
+<script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
+<form method="post" action="#" id="cashfree-pay-form" onsubmit="return false;">
+    <input type="submit" id="renderBtn" value="Pay Now" />
+</form>
+<script>
+(function () {
+    var cashfree = Cashfree({ mode: "{$mode}" });
+    var usePopup = {$popup_js};
+    function startCheckout() {
+        var opts = {
+            paymentSessionId: "{$session}",
+            platformName: "wh"
+        };
+        if (usePopup) {
+            opts.redirectTarget = "_modal";
+            cashfree.checkout(opts).then(function () {
+                window.location.href = "{$callback}";
             });
-            $domContentLoadedScript
-        </script>
-        </html>
-    EOT;
+        } else {
+            cashfree.checkout(opts);
+        }
+    }
+    var btn = document.getElementById("renderBtn");
+    if (btn) {
+        btn.addEventListener("click", function (e) {
+            e.preventDefault();
+            startCheckout();
+        });
+    }
+})();
+</script>
+EOT;
 }
 
+/**
+ * @param array $cf_request
+ * @param array $params
+ * @return string|null
+ */
 function generatePaymentSession($cf_request, $params)
 {
-    $api_endpoint = ($params['testMode'] == 'on') ? 'https://sandbox.cashfree.com/pg/orders' : 'https://api.cashfree.com/pg/orders';
-    
-    $get_cashfree_order_url = $api_endpoint."/".$cf_request['orderId'];
-    
+    $api_endpoint = ($params['testMode'] == 'on')
+        ? 'https://sandbox.cashfree.com/pg/orders'
+        : 'https://api.cashfree.com/pg/orders';
+
+    $get_cashfree_order_url = $api_endpoint . '/' . rawurlencode($cf_request['orderId']);
     $get_order = getCfOrder($params, $get_cashfree_order_url);
 
-    if ($get_order && $get_order->order_status == 'ACTIVE' &&
-        $get_order->order_amount == $params['amount'] && $get_order->order_currency == $params['currency']) {
-            return $get_order->payment_session_id;
+    if (
+        $get_order
+        && isset($get_order->order_status)
+        && $get_order->order_status == 'ACTIVE'
+        && isset($get_order->order_amount, $get_order->order_currency, $get_order->payment_session_id)
+        && cashfree_amounts_match($params['amount'], $get_order->order_amount)
+        && $get_order->order_currency == $params['currency']
+    ) {
+        return $get_order->payment_session_id;
     }
 
-    $payment_session_id = createCashfreeOrder($cf_request, $params, $api_endpoint);
-
-    if ($payment_session_id) {
-        return $payment_session_id;
-    } else {
-        die("Unable to create your order. Please contact support.");
-    }
+    return createCashfreeOrder($cf_request, $params, $api_endpoint);
 }
 
-function getCfOrder($params, $curl_url) {
+/**
+ * @param array $params
+ * @param string $curl_url
+ * @return object|null
+ */
+function getCfOrder($params, $curl_url)
+{
     $curl = curl_init();
-
-    curl_setopt_array($curl, [
-        CURLOPT_URL             => $curl_url,
-        CURLOPT_RETURNTRANSFER  => true,
-        CURLOPT_ENCODING        => "",
-        CURLOPT_MAXREDIRS       => 10,
-        CURLOPT_TIMEOUT         => 30,
-        CURLOPT_HTTP_VERSION    => CURL_HTTP_VERSION_1_1,
-        CURLOPT_CUSTOMREQUEST   => "GET",
-        CURLOPT_HTTPHEADER      => [
-            "Accept:            application/json",
-            "Content-Type:      application/json",
-            "x-api-version:     " . API_VERSION,
-            "x-client-id:       ".$params['appId'],
-            "x-client-secret:   ".$params['secretKey']
-        ],
-    ]);
+    curl_setopt_array($curl, array(
+        CURLOPT_URL => $curl_url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_ENCODING => '',
+        CURLOPT_MAXREDIRS => 10,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+        CURLOPT_CUSTOMREQUEST => 'GET',
+        CURLOPT_HTTPHEADER => array(
+            'Accept: application/json',
+            'Content-Type: application/json',
+            'x-api-version: ' . API_VERSION,
+            'x-client-id: ' . $params['appId'],
+            'x-client-secret: ' . $params['secretKey'],
+        ),
+    ));
 
     $response = curl_exec($curl);
-
     $err = curl_error($curl);
-
     curl_close($curl);
 
-    if ($err) {
-        die("Unable to create your order. Please contact support.");
-    }
-    
-    return json_decode($response);
-}
-
-function createCashfreeOrder($cf_request, $params, $api_endpoint) {
-    $phone_number = $params['clientdetails']['phonenumber'];
-    if (strlen($phone_number) < 10) {
-        $phone_number = "9999999999";
-    } else if(strlen($phone_number) > 10) {
-        $phone_number = preg_replace('/\D/', '', $phone_number);
-        $phone_number = '+' . $phone_number;
-    }
-    $customer_details = array(
-        "customer_id"       => "WhmcsCustomer",
-        "customer_email"    => $params['clientdetails']['email'],
-        "customer_name"     => $params['clientdetails']['firstname'].' '.$params['clientdetails']['lastname'],
-        "customer_phone"    => $phone_number
-    );
-    $order_meta = array(
-        "return_url"        => $cf_request['returnUrl'],
-        "notify_url"        => $cf_request['notifyUrl']
-    );
-    $request = array(
-        "customer_details"  => $customer_details,
-        "order_id"          => $cf_request['orderId'],
-        "order_amount"      => $params['amount'],
-        "order_currency"    => $params['currency'],
-        "order_note"        => "WHMCS Order",
-        "order_meta"        => $order_meta
-    );
-
-    $curl_postfield = json_encode($request);
-
-    $curl = curl_init();
-
-    curl_setopt_array($curl, [
-        CURLOPT_URL             => $api_endpoint,
-        CURLOPT_RETURNTRANSFER  => true,
-        CURLOPT_ENCODING        => "",
-        CURLOPT_MAXREDIRS       => 10,
-        CURLOPT_TIMEOUT         => 30,
-        CURLOPT_HTTP_VERSION    => CURL_HTTP_VERSION_1_1,
-        CURLOPT_CUSTOMREQUEST   => "POST",
-        CURLOPT_POSTFIELDS      => $curl_postfield,
-        CURLOPT_HTTPHEADER      => [
-            "Accept:            application/json",
-            "Content-Type:      application/json",
-            "x-api-version:     " . API_VERSION,
-            "x-client-id:       ".$params['appId'],
-            "x-client-secret:   ".$params['secretKey']
-        ],
-    ]);
-
-    $response = curl_exec($curl);
-    $httpcode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    curl_close($curl);
-    if ($httpcode != 200) {
-        $errArray = json_decode($response, true);
-        if (isset($errArray['message'])) {
-            die($errArray['message']);
-        }
-        die("Unable to create your order. Please contact support.");
-    }
-    $cf_order = json_decode($response);
-
-    if ($cf_order && !empty($cf_order->payment_session_id)) {
-        return $cf_order->payment_session_id;
-    } else {
+    if ($err || $response === false) {
         return null;
     }
 
+    $decoded = json_decode($response);
+    return is_object($decoded) ? $decoded : null;
+}
+
+/**
+ * @param array $cf_request
+ * @param array $params
+ * @param string $api_endpoint
+ * @return string|null
+ */
+function createCashfreeOrder($cf_request, $params, $api_endpoint)
+{
+    $client_id = isset($params['clientdetails']['userid'])
+        ? (string) $params['clientdetails']['userid']
+        : (isset($params['clientdetails']['id']) ? (string) $params['clientdetails']['id'] : '0');
+
+    $customer_details = array(
+        'customer_id' => 'whmcs_' . $client_id,
+        'customer_email' => $params['clientdetails']['email'],
+        'customer_name' => $params['clientdetails']['firstname'] . ' ' . $params['clientdetails']['lastname'],
+        'customer_phone' => cashfree_normalize_phone(
+            isset($params['clientdetails']['phonenumber']) ? $params['clientdetails']['phonenumber'] : ''
+        ),
+    );
+
+    $order_meta = array(
+        'return_url' => $cf_request['returnUrl'],
+        'notify_url' => $cf_request['notifyUrl'],
+    );
+
+    $request = array(
+        'customer_details' => $customer_details,
+        'order_id' => $cf_request['orderId'],
+        'order_amount' => (float) $params['amount'],
+        'order_currency' => $params['currency'],
+        'order_note' => 'WHMCS Order',
+        'order_meta' => $order_meta,
+    );
+
+    $curl = curl_init();
+    curl_setopt_array($curl, array(
+        CURLOPT_URL => $api_endpoint,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_ENCODING => '',
+        CURLOPT_MAXREDIRS => 10,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+        CURLOPT_CUSTOMREQUEST => 'POST',
+        CURLOPT_POSTFIELDS => json_encode($request),
+        CURLOPT_HTTPHEADER => array(
+            'Accept: application/json',
+            'Content-Type: application/json',
+            'x-api-version: ' . API_VERSION,
+            'x-client-id: ' . $params['appId'],
+            'x-client-secret: ' . $params['secretKey'],
+        ),
+    ));
+
+    $response = curl_exec($curl);
+    $httpcode = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
+    curl_close($curl);
+
+    if ($httpcode != 200) {
+        return null;
+    }
+
+    $cf_order = json_decode($response);
+    if ($cf_order && !empty($cf_order->payment_session_id)) {
+        return $cf_order->payment_session_id;
+    }
+
+    return null;
 }
