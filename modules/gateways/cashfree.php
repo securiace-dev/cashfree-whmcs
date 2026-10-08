@@ -1,5 +1,5 @@
 <?php
-define('CASHFREE_PLUGIN_VERSION', '2.4.3', true);
+define('CASHFREE_PLUGIN_VERSION', '2.4.4', true);
 define('API_VERSION', '2022-09-01');
 
 require_once __DIR__ . '/cashfree/lib/CashfreeHelpers.php';

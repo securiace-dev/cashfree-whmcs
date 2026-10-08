@@ -233,3 +233,93 @@ if (!function_exists('cashfree_js_string')) {
         );
     }
 }
+
+if (!function_exists('cashfree_payment_lock_name')) {
+    /**
+     * MySQL GET_LOCK name for a Cashfree payment id (max 64 chars).
+     *
+     * @param string $transactionId Cashfree cf_payment_id / referenceId
+     * @return string
+     */
+    function cashfree_payment_lock_name($transactionId)
+    {
+        return 'cf_pay_' . substr(hash('sha256', (string) $transactionId), 0, 40);
+    }
+}
+
+if (!function_exists('cashfree_credit_decision')) {
+    /**
+     * Pure decision matrix for whether this worker should call addInvoicePayment.
+     *
+     * @param bool $lockAcquired
+     * @param bool $alreadyRecorded
+     * @return string apply|duplicate|lock_busy
+     */
+    function cashfree_credit_decision($lockAcquired, $alreadyRecorded)
+    {
+        if (!$lockAcquired) {
+            return 'lock_busy';
+        }
+        if ($alreadyRecorded) {
+            return 'duplicate';
+        }
+        return 'apply';
+    }
+}
+
+if (!function_exists('cashfree_apply_invoice_payment_once')) {
+    /**
+     * Atomically credit an invoice at most once per Cashfree transaction id.
+     *
+     * Holds a MySQL advisory lock across the exists-check and addInvoicePayment
+     * so browser return and server notify cannot both credit the same cf_payment_id.
+     * Soft Capsule exists-checks alone are racy (TOCTOU) under concurrent callbacks.
+     *
+     * Requires WHMCS Capsule + addInvoicePayment (not for offline unit tests).
+     *
+     * @param int|string $invoiceId
+     * @param string $transactionId
+     * @param mixed $amount
+     * @param string $gatewayModule
+     * @return string applied|duplicate|lock_busy|invalid
+     */
+    function cashfree_apply_invoice_payment_once($invoiceId, $transactionId, $amount, $gatewayModule)
+    {
+        $transactionId = trim((string) $transactionId);
+        if ($transactionId === '' || $invoiceId === '' || $invoiceId === null) {
+            return 'invalid';
+        }
+        if (!class_exists('WHMCS\\Database\\Capsule') || !function_exists('addInvoicePayment')) {
+            return 'invalid';
+        }
+
+        $lockName = cashfree_payment_lock_name($transactionId);
+        $got = \WHMCS\Database\Capsule::selectOne('SELECT GET_LOCK(?, 15) AS g', array($lockName));
+        $lockAcquired = $got && (int) $got->g === 1;
+
+        try {
+            $already = false;
+            if ($lockAcquired) {
+                $already = \WHMCS\Database\Capsule::table('tblaccounts')
+                    ->where('transid', $transactionId)
+                    ->exists();
+            }
+            $decision = cashfree_credit_decision($lockAcquired, $already);
+            if ($decision !== 'apply') {
+                return $decision;
+            }
+            addInvoicePayment(
+                $invoiceId,
+                $transactionId,
+                $amount,
+                0,
+                $gatewayModule
+            );
+            return 'applied';
+        } finally {
+            if ($lockAcquired) {
+                \WHMCS\Database\Capsule::selectOne('SELECT RELEASE_LOCK(?) AS r', array($lockName));
+            }
+        }
+    }
+}
