@@ -8,6 +8,7 @@
  *
  * Credits invoices only after signature verification, SUCCESS status,
  * invoice validation, and amount match. Never force-marks invoices Unpaid.
+ * Idempotent with browser return via cashfree_apply_invoice_payment_once().
  */
 
 require_once __DIR__ . '/../../../init.php';
@@ -75,6 +76,17 @@ if (!$invoice_details) {
     exit;
 }
 
+$transaction_id = (string) $event['transaction_id'];
+
+// Fast path: already recorded (covers post-settle duplicate webhooks).
+if (Capsule::table('tblaccounts')->where('transid', $transaction_id)->exists()) {
+    http_response_code(200);
+    echo 'OK';
+    exit;
+}
+
+// Invoice already settled by another path/gateway — do not stack another credit.
+// Concurrent return+notify while still Unpaid is handled by the locked apply helper.
 if ($invoice_details->status === 'Paid') {
     http_response_code(200);
     echo 'OK';
@@ -91,23 +103,28 @@ if (!cashfree_amounts_match($invoice_details->total, $event['amount'])) {
     exit;
 }
 
-$transaction_id = (string) $event['transaction_id'];
-checkCbTransID($transaction_id);
-
-addInvoicePayment(
+$outcome = cashfree_apply_invoice_payment_once(
     $invoice_id,
     $transaction_id,
     $invoice_details->total,
-    0,
     $gateway_module_name
 );
 
-logTransaction($gateway_params['name'], array(
-    'order_id' => $event['order_id'],
-    'transaction_id' => $transaction_id,
-    'format' => $event['format'],
-    'payment_status' => $event['payment_status'],
-), 'Webhook payment applied');
+if ($outcome === 'applied') {
+    logTransaction($gateway_params['name'], array(
+        'order_id' => $event['order_id'],
+        'transaction_id' => $transaction_id,
+        'format' => $event['format'],
+        'payment_status' => $event['payment_status'],
+    ), 'Webhook payment applied');
+} else {
+    logTransaction($gateway_params['name'], array(
+        'order_id' => $event['order_id'],
+        'transaction_id' => $transaction_id,
+        'outcome' => $outcome,
+        'format' => $event['format'],
+    ), 'Webhook idempotent skip — ' . $outcome);
+}
 
 http_response_code(200);
 echo 'OK';

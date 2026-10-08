@@ -3,7 +3,8 @@
  * WHMCS Cashfree Payment Return / Callback
  *
  * Verifies payment via Cashfree Orders API, then applies invoice payment
- * when status is SUCCESS and amounts match. Idempotent on duplicate trans IDs.
+ * when status is SUCCESS and amounts match. Idempotent on duplicate trans IDs
+ * (advisory lock shared with cashfree_notify.php).
  */
 
 require_once __DIR__ . '/../../../init.php';
@@ -108,16 +109,34 @@ if ($response === false || $curl_error !== '') {
 }
 
 if ($success === true) {
-    $exists = Capsule::table('tblaccounts')->where('transid', $transaction_id)->exists();
-    if (!$exists) {
-        addInvoicePayment(
-            $invoice_id,
-            $transaction_id,
-            $cf_order_amount,
-            0,
-            $gateway_module_name
-        );
+    $outcome = cashfree_apply_invoice_payment_once(
+        $invoice_id,
+        $transaction_id,
+        $cf_order_amount,
+        $gateway_module_name
+    );
+    if ($outcome === 'applied') {
         logTransaction($gateway_params['name'], $payment_log, 'Successful');
+    } elseif ($outcome === 'duplicate' || $outcome === 'lock_busy') {
+        logTransaction(
+            $gateway_params['name'],
+            array(
+                'order_id' => $cashfree_order_id,
+                'transaction_id' => $transaction_id,
+                'outcome' => $outcome,
+            ),
+            'Return idempotent skip — already recorded'
+        );
+    } else {
+        logTransaction(
+            $gateway_params['name'],
+            array(
+                'order_id' => $cashfree_order_id,
+                'transaction_id' => $transaction_id,
+                'outcome' => $outcome,
+            ),
+            'Return credit skipped — invalid state'
+        );
     }
     header('Location: ' . $system_url . 'viewinvoice.php?id=' . $invoice_id . '&paymentsuccess=true');
     exit;

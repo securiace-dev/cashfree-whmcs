@@ -123,6 +123,26 @@ assert_true(
 // JS escape
 assert_true(strpos(cashfree_js_string('a"b'), '\\"') !== false, 'js escape quote');
 
+// --- idempotent credit decision (return + notify race matrix) ---
+assert_true(cashfree_credit_decision(true, false) === 'apply', 'lock held + unseen transid → apply');
+assert_true(cashfree_credit_decision(true, true) === 'duplicate', 'lock held + existing transid → duplicate');
+assert_true(cashfree_credit_decision(false, false) === 'lock_busy', 'lock miss → lock_busy (other worker applying)');
+assert_true(cashfree_credit_decision(false, true) === 'lock_busy', 'lock miss wins over exists flag');
+$lockName = cashfree_payment_lock_name('6690909903');
+assert_true(strpos($lockName, 'cf_pay_') === 0 && strlen($lockName) <= 64, 'lock name length for MySQL GET_LOCK');
+assert_true(cashfree_payment_lock_name('6690909903') === cashfree_payment_lock_name('6690909903'), 'lock name stable');
+assert_true(cashfree_payment_lock_name('a') !== cashfree_payment_lock_name('b'), 'lock name distinct per transid');
+
+// Offline: apply helper must refuse without WHMCS bootstrap (no Capsule / addInvoicePayment)
+assert_true(
+    cashfree_apply_invoice_payment_once(300003464, '6690909903', 1.00, 'cashfree') === 'invalid',
+    'apply_once without WHMCS returns invalid'
+);
+assert_true(
+    cashfree_apply_invoice_payment_once(300003464, '', 1.00, 'cashfree') === 'invalid',
+    'empty transid rejected'
+);
+
 if ($failures > 0) {
     echo "\n{$failures} failure(s)\n";
     exit(1);

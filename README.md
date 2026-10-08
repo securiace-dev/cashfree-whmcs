@@ -7,7 +7,7 @@
 
 Allows you to use Cashfree payment gateway with the WHMCS.
 
-**Plugin version:** 2.4.3 · **Cashfree PG API version header:** `2022-09-01`
+**Plugin version:** 2.4.4 · **Cashfree PG API version header:** `2022-09-01`
 
 ## Description
 
