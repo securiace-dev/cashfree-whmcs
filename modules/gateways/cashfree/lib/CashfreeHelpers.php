@@ -3,6 +3,98 @@
  * Pure helpers for Cashfree WHMCS gateway (testable without WHMCS bootstrap).
  */
 
+/** Hard cap for Cashfree notify / webhook request bodies (bytes). */
+if (!defined('CASHFREE_WEBHOOK_MAX_BODY_BYTES')) {
+    define('CASHFREE_WEBHOOK_MAX_BODY_BYTES', 65536);
+}
+
+if (!function_exists('cashfree_webhook_max_body_bytes')) {
+    /**
+     * Maximum accepted webhook / notify body size in bytes.
+     *
+     * @return int
+     */
+    function cashfree_webhook_max_body_bytes()
+    {
+        return (int) CASHFREE_WEBHOOK_MAX_BODY_BYTES;
+    }
+}
+
+if (!function_exists('cashfree_reject_oversized_content_length')) {
+    /**
+     * Reject oversized Content-Length before reading php://input.
+     *
+     * Missing / empty Content-Length is allowed; the capped read still enforces the limit.
+     *
+     * @param mixed $contentLengthHeader $_SERVER['CONTENT_LENGTH'] or null
+     * @param int|null $maxBytes Defaults to cashfree_webhook_max_body_bytes()
+     * @return array{ok:bool,error?:string,http_status?:int}
+     */
+    function cashfree_reject_oversized_content_length($contentLengthHeader, $maxBytes = null)
+    {
+        $max = $maxBytes !== null ? (int) $maxBytes : cashfree_webhook_max_body_bytes();
+        if ($max < 1) {
+            return array('ok' => false, 'error' => 'Invalid body size limit', 'http_status' => 500);
+        }
+        if ($contentLengthHeader === null || $contentLengthHeader === '') {
+            return array('ok' => true);
+        }
+        $trimmed = trim((string) $contentLengthHeader);
+        // Require a non-negative integer Content-Length (no floats / scientific notation).
+        if ($trimmed === '' || !ctype_digit($trimmed)) {
+            return array('ok' => false, 'error' => 'Invalid Content-Length', 'http_status' => 400);
+        }
+        $length = (int) $trimmed;
+        if ($length > $max) {
+            return array('ok' => false, 'error' => 'Request body too large', 'http_status' => 413);
+        }
+        return array('ok' => true);
+    }
+}
+
+if (!function_exists('cashfree_enforce_body_byte_limit')) {
+    /**
+     * Enforce a byte limit on an already-buffered body string.
+     *
+     * @param string $rawBody
+     * @param int|null $maxBytes
+     * @return array{ok:bool,body?:string,error?:string,http_status?:int}
+     */
+    function cashfree_enforce_body_byte_limit($rawBody, $maxBytes = null)
+    {
+        $max = $maxBytes !== null ? (int) $maxBytes : cashfree_webhook_max_body_bytes();
+        if (!is_string($rawBody)) {
+            return array('ok' => false, 'error' => 'Invalid request body', 'http_status' => 400, 'body' => '');
+        }
+        if (strlen($rawBody) > $max) {
+            return array('ok' => false, 'error' => 'Request body too large', 'http_status' => 413, 'body' => '');
+        }
+        return array('ok' => true, 'body' => $rawBody);
+    }
+}
+
+if (!function_exists('cashfree_read_webhook_raw_body')) {
+    /**
+     * Read php://input with a hard byte cap (reads at most max+1 bytes to detect oversize).
+     *
+     * @param int|null $maxBytes
+     * @return array{ok:bool,body:string,error?:string,http_status?:int}
+     */
+    function cashfree_read_webhook_raw_body($maxBytes = null)
+    {
+        $max = $maxBytes !== null ? (int) $maxBytes : cashfree_webhook_max_body_bytes();
+        if ($max < 1) {
+            return array('ok' => false, 'error' => 'Invalid body size limit', 'http_status' => 500, 'body' => '');
+        }
+        // Cap the read so an attacker cannot drive unbounded allocation via php://input.
+        $raw = @file_get_contents('php://input', false, null, 0, $max + 1);
+        if ($raw === false) {
+            $raw = '';
+        }
+        return cashfree_enforce_body_byte_limit($raw, $max);
+    }
+}
+
 if (!function_exists('cashfree_extract_invoice_id')) {
     /**
      * Order ids are formatted as cf{unix}_{invoiceId}.
@@ -86,7 +178,8 @@ if (!function_exists('cashfree_parse_webhook_event')) {
             if (!cashfree_verify_webhook_signature($signature, $timestamp, $rawBody, $secretKey)) {
                 return array('ok' => false, 'error' => 'Invalid webhook signature');
             }
-            $payload = json_decode($rawBody, true);
+            // Depth-capped decode: webhook JSON is shallow; deep nesting is not legitimate.
+            $payload = json_decode($rawBody, true, 32);
             if (!is_array($payload)) {
                 return array('ok' => false, 'error' => 'Invalid webhook JSON');
             }

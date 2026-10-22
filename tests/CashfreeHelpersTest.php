@@ -103,6 +103,15 @@ $badModern = cashfree_parse_webhook_event($raw, array(), array(
 ), $secret);
 assert_true($badModern['ok'] === false, 'modern bad signature rejected');
 
+// Replay signed sample: signature must still verify after size helpers (body unchanged).
+$replayCheck = cashfree_enforce_body_byte_limit($raw);
+assert_true($replayCheck['ok'] === true && $replayCheck['body'] === $raw, 'signed sample within body limit');
+$replay = cashfree_parse_webhook_event($replayCheck['body'], array(), array(
+    'HTTP_X_WEBHOOK_SIGNATURE' => $sig,
+    'HTTP_X_WEBHOOK_TIMESTAMP' => $ts,
+), $secret);
+assert_true($replay['ok'] === true && $replay['event']['is_success'] === true, 'signed sample webhook replays');
+
 $failedRaw = json_encode(array(
     'data' => array(
         'order' => array('order_id' => 'cf2_77', 'order_amount' => 50.5, 'order_currency' => 'INR'),
@@ -141,6 +150,53 @@ assert_true(
 assert_true(
     cashfree_apply_invoice_payment_once(300003464, '', 1.00, 'cashfree') === 'invalid',
     'empty transid rejected'
+);
+
+// --- webhook body size cap (CVE-2026-109618 / 109619 hardening) ---
+assert_true(cashfree_webhook_max_body_bytes() === 65536, 'default max body is 64 KiB');
+assert_true(cashfree_reject_oversized_content_length(null)['ok'] === true, 'missing Content-Length allowed');
+assert_true(cashfree_reject_oversized_content_length('')['ok'] === true, 'empty Content-Length allowed');
+assert_true(cashfree_reject_oversized_content_length('1024')['ok'] === true, 'small Content-Length accepted');
+assert_true(cashfree_reject_oversized_content_length('65536')['ok'] === true, 'exact max Content-Length accepted');
+$overLen = cashfree_reject_oversized_content_length('65537');
+assert_true(
+    $overLen['ok'] === false && isset($overLen['http_status']) && $overLen['http_status'] === 413,
+    'oversize Content-Length rejected with 413'
+);
+$badLen = cashfree_reject_oversized_content_length('12.5');
+assert_true(
+    $badLen['ok'] === false && isset($badLen['http_status']) && $badLen['http_status'] === 400,
+    'non-integer Content-Length rejected with 400'
+);
+$negLen = cashfree_reject_oversized_content_length('-1');
+assert_true(
+    $negLen['ok'] === false && isset($negLen['http_status']) && $negLen['http_status'] === 400,
+    'negative Content-Length rejected with 400'
+);
+
+$okBody = cashfree_enforce_body_byte_limit(str_repeat('a', 65536));
+assert_true($okBody['ok'] === true && strlen($okBody['body']) === 65536, 'body at exact max accepted');
+$overBody = cashfree_enforce_body_byte_limit(str_repeat('b', 65537));
+assert_true(
+    $overBody['ok'] === false
+        && isset($overBody['http_status'])
+        && $overBody['http_status'] === 413
+        && $overBody['body'] === '',
+    'oversize body rejected with 413'
+);
+$customCap = cashfree_enforce_body_byte_limit('hello-world', 5);
+assert_true(
+    $customCap['ok'] === false && $customCap['http_status'] === 413,
+    'custom maxBytes enforced'
+);
+$customOk = cashfree_enforce_body_byte_limit('hi', 5);
+assert_true($customOk['ok'] === true && $customOk['body'] === 'hi', 'body under custom max accepted');
+
+// Custom Content-Length max for unit isolation
+$customLen = cashfree_reject_oversized_content_length('10', 8);
+assert_true(
+    $customLen['ok'] === false && $customLen['http_status'] === 413,
+    'Content-Length respects custom maxBytes'
 );
 
 if ($failures > 0) {
