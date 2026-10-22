@@ -36,7 +36,7 @@ This repository contains integration code for interaction with the Cashfree API 
 | Browser return | `{systemurl}modules/gateways/cashfree/cashfree.php?order_id={order_id}` |
 | Server notify / webhook | `{systemurl}modules/gateways/cashfree/cashfree_notify.php` |
 
-The notify endpoint accepts modern Cashfree JSON webhooks (`x-webhook-signature` / `x-webhook-timestamp`) and legacy form-encoded notify payloads. Payments are applied only after signature verification, `SUCCESS` status, invoice validation, and amount match.
+The notify endpoint accepts modern Cashfree JSON webhooks (`x-webhook-signature` / `x-webhook-timestamp`) and legacy form-encoded notify payloads. Payments are applied only after signature verification, `SUCCESS` status, invoice validation, and amount match. Request bodies larger than 64 KiB are rejected with HTTP 413 before the full payload is buffered.
 
 ## Local helper tests
 
