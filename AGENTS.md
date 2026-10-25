@@ -8,12 +8,21 @@
 - **Merge to `master` is not a deploy.** Do not claim the gateway is live until Dokploy / `whmcs-prod-new` admission + smoke are done.
 - **Retired method only:** FastPanel-era **loose rsync of module trees** as the release path. Do **not** treat “avoid 195.7.4.219” as policy — that IP is prod Dokploy; use the `whmcs-prod-new` admit/overlay flow (or authorized `docker exec` into `whmcs-production-*-app-1`), never ad-hoc FastPanel file drops.
 - **Never deploy without an explicit go** from the operator.
-- Operator Mac sources of truth (often not mounted in cloud):
-  - `~/Projects/whmcs-prod-new` (`/Users/kritananda/Projects/whmcs-prod-new`) — **primary**
+- **Auth (standard practice — never violate):**
+  - GitHub private repos / tooling: Mac **`gh-accounts`** (reuse existing accounts).
+  - Prod SSH: existing Mac key/aliases (`~/.ssh/id_rsa_securiace` → `root@195.7.4.219`;
+    aliases `ded1-securiace-com` / `sat-de-prod01`).
+  - **Do not** ask for per-project Cloud Agent secrets, PATs, or SSH keys for this
+    repo alone. Prefer the self-hosted worker
+    `~/Projects/whmcs-prod-new @ Sri's MacBook Pro`.
+- Operator Mac sources of truth:
+  - `~/Projects/whmcs-prod-new` — **primary** control plane
   - `~/Projects/whmcs-devbox`
   - `~/.ai-audit/` (prior deploy learnings)
-  - related: `securiace-dev/securiace-whmcs-prod`, `yashodhank/whmcs-prod` (vendor/admission helpers)
-- Sister-repo contract (when private trees are unavailable):
+  - related: `securiace-dev/securiace-whmcs-prod`, vendor helpers in `whmcs-prod`
+- Canonical workflow store: `workflows/whmcs-dokploy-deploy.md` +
+  `workflows/mac-gh-accounts-and-ssh.md` (user Cursor store).
+- Sister-repo contract when needed:
   `securiace-dev/contabo-pricing-scraper` → `docs/operations/DOKPLOY_WHMCS_MODULE_DEPLOY.md`
 
 ### This module’s runtime paths
