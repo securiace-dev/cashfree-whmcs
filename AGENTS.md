@@ -8,19 +8,17 @@
 - **Merge to `master` is not a deploy.** Do not claim the gateway is live until Dokploy / `whmcs-prod-new` admission + smoke are done.
 - **Retired method only:** FastPanel-era **loose rsync of module trees** as the release path. Do **not** treat “avoid 195.7.4.219” as policy — that IP is prod Dokploy; use the `whmcs-prod-new` admit/overlay flow (or authorized `docker exec` into `whmcs-production-*-app-1`), never ad-hoc FastPanel file drops.
 - **Auth (standard practice — never violate):**
-  - GitHub private repos / tooling: Mac **`gh-accounts`** (reuse existing accounts).
-  - Prod SSH: existing Mac key/aliases (`~/.ssh/id_rsa_securiace` → `root@195.7.4.219`;
-    aliases `ded1-securiace-com` / `sat-de-prod01`).
-  - **Do not** ask for per-project Cloud Agent secrets, PATs, or SSH keys for this
-    repo alone. Prefer the self-hosted worker
-    `~/Projects/whmcs-prod-new @ Sri's MacBook Pro`
-    (use `list-self-hosted-workers` for current `workerId` when connected).
-  - **Block lifted (2026-10-25):** when that Mac worker is connected, **proceed** with
-    the Dokploy / `whmcs-prod-new` ship path to finish the job. Place via
-    `CreateAgent` + `machine.type=self_hosted_worker` when available; otherwise UI
-    agent on that worker or `@cursoragent worker=…` on a `whmcs-prod-new` PR.
-    Never stall asking for new keys. Still prefer overlay pin + image (no FastPanel
-    loose rsync); no secrets in chat/commits.
+  - **Cursor identity:** `yashodhan.kulkarni@gmail.com` **only** (Premium). Never use
+    `yashodhan@securiace.com` for Cursor, and never cloud-browser OTP as a workaround.
+  - **GitHub on Mac:** `/Users/kritananda/.local/bin/gh-account` to switch accounts per
+    project (GitHub identity may differ from Cursor). Prefer the Mac worker over
+    cloud `gh` as the `cursor` bot for private control-plane repos.
+  - **Prod SSH:** `~/.ssh/id_rsa_securiace` → `root@195.7.4.219` (aliases
+    `ded1-securiace-com` / `sat-de-prod01`).
+  - Prefer self-hosted worker `~/Projects/whmcs-prod-new @ Sri's MacBook Pro`
+    (`list-self-hosted-workers` for `workerId`). Place with `CreateAgent` +
+    `machine.type=self_hosted_worker` when that tool exists. Overlay pin + image;
+    no FastPanel loose rsync; no per-project secret asks; no secrets in chat/commits.
 - Operator Mac sources of truth:
   - `~/Projects/whmcs-prod-new` — **primary** control plane
   - `~/Projects/whmcs-devbox`
