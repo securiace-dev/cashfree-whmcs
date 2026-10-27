@@ -1,8 +1,12 @@
 <?php
-define('CASHFREE_PLUGIN_VERSION', '2.4.4', true);
-define('API_VERSION', '2022-09-01');
-
 require_once __DIR__ . '/cashfree/lib/CashfreeHelpers.php';
+
+if (!defined('CASHFREE_PLUGIN_VERSION')) {
+    define('CASHFREE_PLUGIN_VERSION', '2.5.0');
+}
+if (!defined('API_VERSION')) {
+    define('API_VERSION', '2022-09-01');
+}
 
 /**
  * WHMCS Cashfree Payment Gateway Module
@@ -18,7 +22,7 @@ if (!defined('WHMCS')) {
 function cashfree_MetaData()
 {
     return array(
-        'DisplayName' => 'Cashfree',
+        'DisplayName' => 'Cashfree ' . CASHFREE_PLUGIN_VERSION,
         // WHMCS gateway module API version (not the plugin release version).
         'APIVersion' => '1.1',
         'DisableLocalCreditCardInput' => true,
@@ -35,7 +39,7 @@ function cashfree_config()
     return array(
         'FriendlyName' => array(
             'Type' => 'System',
-            'Value' => 'Cashfree',
+            'Value' => 'Cashfree ' . CASHFREE_PLUGIN_VERSION,
         ),
         'appId' => array(
             'FriendlyName' => 'App Id',
