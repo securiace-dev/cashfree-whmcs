@@ -7,7 +7,9 @@
 
 Allows you to use Cashfree payment gateway with the WHMCS.
 
-**Plugin version:** 2.4.4 · **Cashfree PG API version header:** `2022-09-01`
+**Plugin version:** 2.5.0 · **Cashfree PG API version header:** `2022-09-01`
+
+This Securiace fork adds an ops-first integrity + reconciliation moat on top of the official plugin (signed webhooks, idempotent credit, body cap, event ledger). See `AGENTS.md` for ship / overlay pin discipline.
 
 ## Description
 
@@ -16,8 +18,9 @@ This repository contains integration code for interaction with the Cashfree API 
 ## Installation
 
 1. Ensure you have a supported WHMCS release (8.x recommended) on PHP 7.4+ / 8.x.
-2. Download the zip of this repo.
+2. Download the zip of this repo (or an immutable artifact from `scripts/package-immutable.sh`).
 3. Upload the contents of the repo to your WHMCS Installation directory (content of `modules/` folder goes in the WHMCS `modules/` folder).
+4. Optionally activate the **Cashfree Ledger** addon (Setup → Addon Modules) for the reconciliation UI.
 
 ## Configuration
 
@@ -36,7 +39,13 @@ This repository contains integration code for interaction with the Cashfree API 
 | Browser return | `{systemurl}modules/gateways/cashfree/cashfree.php?order_id={order_id}` |
 | Server notify / webhook | `{systemurl}modules/gateways/cashfree/cashfree_notify.php` |
 
-The notify endpoint accepts modern Cashfree JSON webhooks (`x-webhook-signature` / `x-webhook-timestamp`) and legacy form-encoded notify payloads. Payments are applied only after signature verification, `SUCCESS` status, invoice validation, and amount match. Request bodies larger than 64 KiB are rejected with HTTP 413 before the full payload is buffered.
+The notify endpoint accepts modern Cashfree JSON webhooks (`x-webhook-signature` / `x-webhook-timestamp`) and legacy form-encoded notify payloads. Payments are applied only after signature verification, timestamp skew check (modern), `SUCCESS` status, invoice validation, and amount + currency match. Request bodies larger than 64 KiB are rejected with HTTP 413 before the full payload is buffered. Duplicate deliveries return HTTP 200 with structured gateway log codes (`applied` / `duplicate` / `rejected_*`). Refund webhooks are ledger-noted only (never auto-debited).
+
+### Reconciliation
+
+- Table: `mod_cashfree_events` (order id, payment id, invoice, amount, currency, verify/credit outcome, raw body SHA-256)
+- Admin: addon **Cashfree Ledger** (filters: problems, applied, duplicate, refunds)
+- CLI (Dokploy): `php -q modules/gateways/cashfree/cli/reconcile.php --days=7` (dry-run; add `--apply` only to credit unmatched SUCCESS)
 
 ## Local helper tests
 
@@ -45,6 +54,14 @@ No WHMCS install required for helper unit tests:
 ```bash
 php tests/CashfreeHelpersTest.php
 ```
+
+## Immutable package
+
+```bash
+bash scripts/package-immutable.sh
+```
+
+Produces `dist/cashfree-whmcs-<version>.zip`, `.sha256`, and `.manifest` for `whmcs-prod-new` overlay pins.
 
 Do not run against production Cashfree credentials from automated tests.
 

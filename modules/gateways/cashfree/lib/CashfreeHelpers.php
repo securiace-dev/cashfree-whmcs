@@ -3,9 +3,19 @@
  * Pure helpers for Cashfree WHMCS gateway (testable without WHMCS bootstrap).
  */
 
+/** Plugin release version (admin UI + immutable package manifest). */
+if (!defined('CASHFREE_PLUGIN_VERSION')) {
+    define('CASHFREE_PLUGIN_VERSION', '2.5.0');
+}
+
 /** Hard cap for Cashfree notify / webhook request bodies (bytes). */
 if (!defined('CASHFREE_WEBHOOK_MAX_BODY_BYTES')) {
     define('CASHFREE_WEBHOOK_MAX_BODY_BYTES', 65536);
+}
+
+/** Max |now − x-webhook-timestamp| skew in seconds (replay window). */
+if (!defined('CASHFREE_WEBHOOK_MAX_TIMESTAMP_SKEW')) {
+    define('CASHFREE_WEBHOOK_MAX_TIMESTAMP_SKEW', 300);
 }
 
 if (!function_exists('cashfree_webhook_max_body_bytes')) {
@@ -95,6 +105,132 @@ if (!function_exists('cashfree_read_webhook_raw_body')) {
     }
 }
 
+if (!function_exists('cashfree_webhook_max_timestamp_skew_seconds')) {
+    /**
+     * @return int
+     */
+    function cashfree_webhook_max_timestamp_skew_seconds()
+    {
+        return (int) CASHFREE_WEBHOOK_MAX_TIMESTAMP_SKEW;
+    }
+}
+
+if (!function_exists('cashfree_webhook_timestamp_fresh')) {
+    /**
+     * Reject stale or future-skewed webhook timestamps (replay window).
+     *
+     * @param mixed $timestamp Header x-webhook-timestamp (unix seconds)
+     * @param int|null $now Unix now; defaults to time()
+     * @param int|null $maxSkew Seconds; defaults to cashfree_webhook_max_timestamp_skew_seconds()
+     * @return array{ok:bool,error?:string}
+     */
+    function cashfree_webhook_timestamp_fresh($timestamp, $now = null, $maxSkew = null)
+    {
+        $skew = $maxSkew !== null ? (int) $maxSkew : cashfree_webhook_max_timestamp_skew_seconds();
+        if ($skew < 1) {
+            return array('ok' => false, 'error' => 'Invalid timestamp skew limit');
+        }
+        $trimmed = trim((string) $timestamp);
+        if ($trimmed === '' || !ctype_digit($trimmed)) {
+            return array('ok' => false, 'error' => 'Invalid webhook timestamp');
+        }
+        $ts = (int) $trimmed;
+        $nowTs = $now !== null ? (int) $now : time();
+        if (abs($nowTs - $ts) > $skew) {
+            return array('ok' => false, 'error' => 'Webhook timestamp outside allowed skew');
+        }
+        return array('ok' => true);
+    }
+}
+
+if (!function_exists('cashfree_currencies_match')) {
+    /**
+     * Case-insensitive currency compare.
+     * If either side is empty (legacy / unknown), do not reject on currency alone —
+     * amount + signature checks still apply. Both set and unequal → fail.
+     *
+     * @param mixed $invoiceCurrency
+     * @param mixed $paidCurrency
+     * @return bool
+     */
+    function cashfree_currencies_match($invoiceCurrency, $paidCurrency)
+    {
+        $left = strtoupper(trim((string) $invoiceCurrency));
+        $right = strtoupper(trim((string) $paidCurrency));
+        if ($left === '' || $right === '') {
+            return true;
+        }
+        return $left === $right;
+    }
+}
+
+if (!function_exists('cashfree_gateway_log_code')) {
+    /**
+     * Structured gateway-log outcome codes for operator filtering.
+     *
+     * @param string $outcome
+     * @return string
+     */
+    function cashfree_gateway_log_code($outcome)
+    {
+        $outcome = (string) $outcome;
+        switch ($outcome) {
+            case 'applied':
+                return 'applied';
+            case 'duplicate':
+                return 'duplicate';
+            case 'lock_busy':
+                return 'lock_busy';
+            case 'rejected_sig':
+                return 'rejected_sig';
+            case 'rejected_amount':
+                return 'rejected_amount';
+            case 'rejected_currency':
+                return 'rejected_currency';
+            case 'rejected_oversize':
+                return 'rejected_oversize';
+            case 'rejected_skew':
+                return 'rejected_skew';
+            case 'ignored_not_success':
+                return 'ignored_not_success';
+            case 'refund_noted':
+                return 'refund_noted';
+            case 'refund_duplicate':
+                return 'refund_duplicate';
+            case 'refund_missing_payment':
+                return 'refund_missing_payment';
+            case 'invalid':
+                return 'invalid';
+            default:
+                return 'unknown';
+        }
+    }
+}
+
+if (!function_exists('cashfree_refund_decision')) {
+    /**
+     * Pure decision matrix for Cashfree refund webhooks (never auto-debits here).
+     *
+     * @param bool $lockAcquired
+     * @param bool $paymentRecorded Original cf_payment_id exists in tblaccounts
+     * @param bool $refundAlreadyRecorded Same refund id already in ledger
+     * @return string note|duplicate|lock_busy|missing_payment|invalid
+     */
+    function cashfree_refund_decision($lockAcquired, $paymentRecorded, $refundAlreadyRecorded)
+    {
+        if (!$lockAcquired) {
+            return 'lock_busy';
+        }
+        if ($refundAlreadyRecorded) {
+            return 'duplicate';
+        }
+        if (!$paymentRecorded) {
+            return 'missing_payment';
+        }
+        return 'note';
+    }
+}
+
 if (!function_exists('cashfree_extract_invoice_id')) {
     /**
      * Order ids are formatted as cf{unix}_{invoiceId}.
@@ -175,25 +311,33 @@ if (!function_exists('cashfree_parse_webhook_event')) {
         $timestamp = isset($server['HTTP_X_WEBHOOK_TIMESTAMP']) ? (string) $server['HTTP_X_WEBHOOK_TIMESTAMP'] : '';
 
         if ($signature !== '' && $timestamp !== '' && $rawBody !== '') {
+            $fresh = cashfree_webhook_timestamp_fresh($timestamp);
+            if (!$fresh['ok']) {
+                return array(
+                    'ok' => false,
+                    'error' => isset($fresh['error']) ? $fresh['error'] : 'Webhook timestamp outside allowed skew',
+                    'code' => 'rejected_skew',
+                );
+            }
             if (!cashfree_verify_webhook_signature($signature, $timestamp, $rawBody, $secretKey)) {
-                return array('ok' => false, 'error' => 'Invalid webhook signature');
+                return array('ok' => false, 'error' => 'Invalid webhook signature', 'code' => 'rejected_sig');
             }
             // Depth-capped decode: webhook JSON is shallow; deep nesting is not legitimate.
             $payload = json_decode($rawBody, true, 32);
             if (!is_array($payload)) {
-                return array('ok' => false, 'error' => 'Invalid webhook JSON');
+                return array('ok' => false, 'error' => 'Invalid webhook JSON', 'code' => 'invalid');
             }
             return cashfree_normalize_modern_payload($payload);
         }
 
         if (!empty($post['orderId']) && isset($post['signature'])) {
             if (!cashfree_verify_legacy_signature($post, $secretKey)) {
-                return array('ok' => false, 'error' => 'Invalid legacy signature');
+                return array('ok' => false, 'error' => 'Invalid legacy signature', 'code' => 'rejected_sig');
             }
             return cashfree_normalize_legacy_post($post);
         }
 
-        return array('ok' => false, 'error' => 'Unrecognized webhook payload');
+        return array('ok' => false, 'error' => 'Unrecognized webhook payload', 'code' => 'invalid');
     }
 }
 
@@ -208,6 +352,7 @@ if (!function_exists('cashfree_normalize_modern_payload')) {
         $data = isset($payload['data']) && is_array($payload['data']) ? $payload['data'] : array();
         $order = isset($data['order']) && is_array($data['order']) ? $data['order'] : array();
         $payment = isset($data['payment']) && is_array($data['payment']) ? $data['payment'] : array();
+        $refund = isset($data['refund']) && is_array($data['refund']) ? $data['refund'] : array();
 
         $orderId = isset($order['order_id']) ? (string) $order['order_id'] : '';
         $paymentStatus = isset($payment['payment_status']) ? strtoupper((string) $payment['payment_status']) : '';
@@ -220,6 +365,54 @@ if (!function_exists('cashfree_normalize_modern_payload')) {
             ? (string) $order['order_currency']
             : (isset($payment['payment_currency']) ? (string) $payment['payment_currency'] : '');
 
+        $refundTypes = array(
+            'PAYMENT_REFUND_WEBHOOK',
+            'REFUND_STATUS_WEBHOOK',
+            'REFUND_SUCCESS_WEBHOOK',
+        );
+        $isRefundEvent = in_array($type, $refundTypes, true) || !empty($refund);
+
+        if ($isRefundEvent) {
+            $refundId = isset($refund['cf_refund_id'])
+                ? (string) $refund['cf_refund_id']
+                : (isset($refund['refund_id']) ? (string) $refund['refund_id'] : '');
+            if ($transactionId === '' && isset($refund['cf_payment_id'])) {
+                $transactionId = (string) $refund['cf_payment_id'];
+            }
+            if ($orderId === '' && isset($refund['order_id'])) {
+                $orderId = (string) $refund['order_id'];
+            }
+            $refundStatus = isset($refund['refund_status'])
+                ? strtoupper((string) $refund['refund_status'])
+                : (isset($refund['status']) ? strtoupper((string) $refund['status']) : '');
+            $refundAmount = isset($refund['refund_amount'])
+                ? $refund['refund_amount']
+                : (isset($refund['amount']) ? $refund['amount'] : null);
+            if ($currency === '' && isset($refund['refund_currency'])) {
+                $currency = (string) $refund['refund_currency'];
+            }
+            if ($orderId === '' || $transactionId === '' || $refundId === '') {
+                return array('ok' => false, 'error' => 'Missing refund, order, or payment id in webhook', 'code' => 'invalid');
+            }
+            $refundOk = ($refundStatus === 'SUCCESS' || $refundStatus === 'COMPLETED' || $refundStatus === '');
+            return array(
+                'ok' => true,
+                'event' => array(
+                    'order_id' => $orderId,
+                    'transaction_id' => $transactionId,
+                    'refund_id' => $refundId,
+                    'amount' => $refundAmount !== null ? $refundAmount : $orderAmount,
+                    'currency' => $currency,
+                    'payment_status' => $refundStatus !== '' ? $refundStatus : 'SUCCESS',
+                    'is_success' => false,
+                    'is_refund' => true,
+                    'refund_ok' => $refundOk,
+                    'raw_type' => $type !== '' ? $type : 'PAYMENT_REFUND_WEBHOOK',
+                    'format' => 'modern',
+                ),
+            );
+        }
+
         $successTypes = array(
             'PAYMENT_SUCCESS_WEBHOOK',
             'PAYMENT_SUCCESS',
@@ -228,7 +421,7 @@ if (!function_exists('cashfree_normalize_modern_payload')) {
         $isSuccessEvent = in_array($type, $successTypes, true) || $paymentStatus === 'SUCCESS';
 
         if ($orderId === '' || $transactionId === '') {
-            return array('ok' => false, 'error' => 'Missing order or payment id in webhook');
+            return array('ok' => false, 'error' => 'Missing order or payment id in webhook', 'code' => 'invalid');
         }
 
         return array(
@@ -236,10 +429,13 @@ if (!function_exists('cashfree_normalize_modern_payload')) {
             'event' => array(
                 'order_id' => $orderId,
                 'transaction_id' => $transactionId,
+                'refund_id' => '',
                 'amount' => $orderAmount,
                 'currency' => $currency,
                 'payment_status' => $paymentStatus !== '' ? $paymentStatus : ($isSuccessEvent ? 'SUCCESS' : 'UNKNOWN'),
                 'is_success' => ($paymentStatus === 'SUCCESS' || ($isSuccessEvent && $paymentStatus === '')),
+                'is_refund' => false,
+                'refund_ok' => false,
                 'raw_type' => $type,
                 'format' => 'modern',
             ),
@@ -266,10 +462,13 @@ if (!function_exists('cashfree_normalize_legacy_post')) {
             'event' => array(
                 'order_id' => $orderId,
                 'transaction_id' => $transactionId,
+                'refund_id' => '',
                 'amount' => isset($post['orderAmount']) ? $post['orderAmount'] : null,
                 'currency' => '',
                 'payment_status' => $txStatus,
                 'is_success' => ($txStatus === 'SUCCESS'),
+                'is_refund' => false,
+                'refund_ok' => false,
                 'raw_type' => 'LEGACY_' . $txStatus,
                 'format' => 'legacy',
             ),
@@ -357,6 +556,110 @@ if (!function_exists('cashfree_credit_decision')) {
             return 'duplicate';
         }
         return 'apply';
+    }
+}
+
+if (!function_exists('cashfree_event_raw_hash')) {
+    /**
+     * SHA-256 of raw body for ledger storage (never store full PII body).
+     *
+     * @param string $rawBody
+     * @return string 64-char hex
+     */
+    function cashfree_event_raw_hash($rawBody)
+    {
+        return hash('sha256', (string) $rawBody);
+    }
+}
+
+if (!function_exists('cashfree_outcome_log_code')) {
+    /**
+     * Map credit / refund worker outcomes to structured gateway log codes.
+     *
+     * @param string $outcome applied|duplicate|lock_busy|invalid|note|missing_payment|…
+     * @param string $kind payment|refund
+     * @return string
+     */
+    function cashfree_outcome_log_code($outcome, $kind = 'payment')
+    {
+        $outcome = (string) $outcome;
+        $kind = (string) $kind;
+        if ($kind === 'refund') {
+            switch ($outcome) {
+                case 'note':
+                    return cashfree_gateway_log_code('refund_noted');
+                case 'duplicate':
+                    return cashfree_gateway_log_code('refund_duplicate');
+                case 'missing_payment':
+                    return cashfree_gateway_log_code('refund_missing_payment');
+                case 'lock_busy':
+                    return cashfree_gateway_log_code('lock_busy');
+                default:
+                    return cashfree_gateway_log_code('invalid');
+            }
+        }
+        switch ($outcome) {
+            case 'applied':
+                return cashfree_gateway_log_code('applied');
+            case 'duplicate':
+                return cashfree_gateway_log_code('duplicate');
+            case 'lock_busy':
+                return cashfree_gateway_log_code('lock_busy');
+            default:
+                return cashfree_gateway_log_code('invalid');
+        }
+    }
+}
+
+if (!function_exists('cashfree_build_ledger_row')) {
+    /**
+     * Pure builder for mod_cashfree_events row fields (no DB).
+     *
+     * @param array $fields
+     * @return array
+     */
+    function cashfree_build_ledger_row(array $fields)
+    {
+        return array(
+            'order_id' => isset($fields['order_id']) ? (string) $fields['order_id'] : '',
+            'cf_payment_id' => isset($fields['cf_payment_id']) ? (string) $fields['cf_payment_id'] : '',
+            'cf_refund_id' => isset($fields['cf_refund_id']) ? (string) $fields['cf_refund_id'] : '',
+            'invoice_id' => isset($fields['invoice_id']) ? (int) $fields['invoice_id'] : 0,
+            'amount' => array_key_exists('amount', $fields) ? $fields['amount'] : null,
+            'currency' => isset($fields['currency']) ? strtoupper(trim((string) $fields['currency'])) : '',
+            'event_type' => isset($fields['event_type']) ? (string) $fields['event_type'] : '',
+            'verify_result' => isset($fields['verify_result']) ? (string) $fields['verify_result'] : '',
+            'credit_outcome' => isset($fields['credit_outcome']) ? (string) $fields['credit_outcome'] : '',
+            'source' => isset($fields['source']) ? (string) $fields['source'] : '',
+            'raw_hash' => isset($fields['raw_hash']) ? (string) $fields['raw_hash'] : '',
+        );
+    }
+}
+
+if (!function_exists('cashfree_recon_drift_label')) {
+    /**
+     * Operator-facing drift label for unpaid invoice vs Cashfree order status.
+     *
+     * @param string $invoiceStatus WHMCS invoice status
+     * @param string $cfOrderStatus Cashfree order_status
+     * @param bool $paymentSuccessOnCf At least one SUCCESS payment on the order
+     * @param bool $whmcsHasPayment tblaccounts already has cf_payment_id
+     * @return string ok|unmatched_success|cf_unpaid|unknown
+     */
+    function cashfree_recon_drift_label($invoiceStatus, $cfOrderStatus, $paymentSuccessOnCf, $whmcsHasPayment)
+    {
+        $invoiceStatus = strtolower(trim((string) $invoiceStatus));
+        $cfOrderStatus = strtoupper(trim((string) $cfOrderStatus));
+        if ($whmcsHasPayment || $invoiceStatus === 'paid') {
+            return 'ok';
+        }
+        if ($paymentSuccessOnCf || $cfOrderStatus === 'PAID') {
+            return 'unmatched_success';
+        }
+        if ($cfOrderStatus === 'ACTIVE' || $cfOrderStatus === 'EXPIRED' || $cfOrderStatus === '') {
+            return 'cf_unpaid';
+        }
+        return 'unknown';
     }
 }
 

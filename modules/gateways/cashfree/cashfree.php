@@ -3,8 +3,8 @@
  * WHMCS Cashfree Payment Return / Callback
  *
  * Verifies payment via Cashfree Orders API, then applies invoice payment
- * when status is SUCCESS and amounts match. Idempotent on duplicate trans IDs
- * (advisory lock shared with cashfree_notify.php).
+ * when status is SUCCESS and amounts + currency match. Idempotent on duplicate
+ * trans IDs (advisory lock shared with cashfree_notify.php).
  */
 
 require_once __DIR__ . '/../../../init.php';
@@ -12,6 +12,7 @@ require_once __DIR__ . '/../../../includes/functions.php';
 require_once __DIR__ . '/../../../includes/gatewayfunctions.php';
 require_once __DIR__ . '/../../../includes/invoicefunctions.php';
 require_once __DIR__ . '/lib/CashfreeHelpers.php';
+require_once __DIR__ . '/lib/CashfreeLedger.php';
 
 use WHMCS\Database\Capsule;
 
@@ -34,7 +35,10 @@ $cashfree_order_id = isset($_REQUEST['order_id']) ? trim((string) $_REQUEST['ord
 $invoice_id = cashfree_extract_invoice_id($cashfree_order_id);
 
 if ($invoice_id === null) {
-    logTransaction($gateway_params['name'], $_REQUEST, 'Return rejected — invalid order id');
+    logTransaction($gateway_params['name'], array(
+        'code' => cashfree_gateway_log_code('invalid'),
+        'request' => $_REQUEST,
+    ), 'Cashfree ' . cashfree_gateway_log_code('invalid'));
     header('Location: ' . $system_url . 'clientarea.php');
     exit;
 }
@@ -72,9 +76,12 @@ curl_close($curl);
 
 $success = false;
 $error = '';
+$error_code = 'invalid';
 $transaction_id = '';
 $cf_order_amount = null;
+$cf_currency = '';
 $payment_log = null;
+$raw_hash = cashfree_event_raw_hash(is_string($response) ? $response : '');
 
 if ($response === false || $curl_error !== '') {
     $error = 'Unable to verify payment with Cashfree';
@@ -82,6 +89,7 @@ if ($response === false || $curl_error !== '') {
     $cf_order = json_decode($response);
     $invoice = Capsule::table('tblinvoices')->where('id', $invoice_id)->first();
     $invoice_amount = $invoice ? $invoice->total : null;
+    $invoice_currency = cashfree_invoice_currency_code($invoice_id);
 
     if (is_object($cf_order) && isset($cf_order->message) && !is_array($cf_order)) {
         $error = (string) $cf_order->message;
@@ -89,16 +97,27 @@ if ($response === false || $curl_error !== '') {
         $payment_log = $cf_order[0];
         if ($cf_order[0]->payment_status == 'SUCCESS') {
             $transaction_id = (string) $cf_order[0]->cf_payment_id;
-            $cf_order_amount = $cf_order[0]->order_amount;
-            if ($invoice_amount !== null && cashfree_amounts_match($invoice_amount, $cf_order_amount)) {
-                $success = true;
-            } else {
+            $cf_order_amount = isset($cf_order[0]->order_amount)
+                ? $cf_order[0]->order_amount
+                : (isset($cf_order[0]->payment_amount) ? $cf_order[0]->payment_amount : null);
+            $cf_currency = isset($cf_order[0]->payment_currency)
+                ? (string) $cf_order[0]->payment_currency
+                : (isset($cf_order[0]->order_currency) ? (string) $cf_order[0]->order_currency : '');
+
+            if ($invoice_amount === null || !cashfree_amounts_match($invoice_amount, $cf_order_amount)) {
                 $error = 'Amount Mismatched';
+                $error_code = 'rejected_amount';
+            } elseif (!cashfree_currencies_match($invoice_currency, $cf_currency)) {
+                $error = 'Currency Mismatched';
+                $error_code = 'rejected_currency';
+            } else {
+                $success = true;
             }
         } else {
             $error = isset($cf_order[0]->payment_message)
                 ? (string) $cf_order[0]->payment_message
                 : 'Payment not successful';
+            $error_code = 'ignored_not_success';
         }
     } else {
         $error = 'Unable to process your order. Please contact support.';
@@ -115,40 +134,50 @@ if ($success === true) {
         $cf_order_amount,
         $gateway_module_name
     );
-    if ($outcome === 'applied') {
-        logTransaction($gateway_params['name'], $payment_log, 'Successful');
-    } elseif ($outcome === 'duplicate' || $outcome === 'lock_busy') {
-        logTransaction(
-            $gateway_params['name'],
-            array(
-                'order_id' => $cashfree_order_id,
-                'transaction_id' => $transaction_id,
-                'outcome' => $outcome,
-            ),
-            'Return idempotent skip — already recorded'
-        );
-    } else {
-        logTransaction(
-            $gateway_params['name'],
-            array(
-                'order_id' => $cashfree_order_id,
-                'transaction_id' => $transaction_id,
-                'outcome' => $outcome,
-            ),
-            'Return credit skipped — invalid state'
-        );
-    }
+    $logCode = cashfree_outcome_log_code($outcome, 'payment');
+    cashfree_ledger_record(array(
+        'order_id' => $cashfree_order_id,
+        'cf_payment_id' => $transaction_id,
+        'invoice_id' => $invoice_id,
+        'amount' => $cf_order_amount,
+        'currency' => $cf_currency,
+        'event_type' => 'RETURN_SUCCESS',
+        'verify_result' => 'ok',
+        'credit_outcome' => $logCode,
+        'source' => 'return',
+        'raw_hash' => $raw_hash,
+    ));
+    $logPayload = is_object($payment_log) ? (array) $payment_log : array();
+    $logPayload['code'] = $logCode;
+    $logPayload['order_id'] = $cashfree_order_id;
+    $logPayload['transaction_id'] = $transaction_id;
+    $logPayload['outcome'] = $outcome;
+    logTransaction($gateway_params['name'], $logPayload, 'Cashfree ' . $logCode);
     header('Location: ' . $system_url . 'viewinvoice.php?id=' . $invoice_id . '&paymentsuccess=true');
     exit;
 }
 
+cashfree_ledger_record(array(
+    'order_id' => $cashfree_order_id,
+    'cf_payment_id' => $transaction_id,
+    'invoice_id' => $invoice_id,
+    'amount' => $cf_order_amount,
+    'currency' => $cf_currency,
+    'event_type' => 'RETURN_FAIL',
+    'verify_result' => $error_code,
+    'credit_outcome' => $error_code,
+    'source' => 'return',
+    'raw_hash' => $raw_hash,
+));
+
 logTransaction(
     $gateway_params['name'],
     array(
+        'code' => cashfree_gateway_log_code($error_code),
         'order_id' => $cashfree_order_id,
         'error' => $error,
     ),
-    'Unsuccessful — ' . $error . '. Please check Cashfree dashboard for order id: ' . $cashfree_order_id
+    'Cashfree ' . cashfree_gateway_log_code($error_code)
 );
 
 header('Location: ' . $system_url . 'viewinvoice.php?id=' . $invoice_id . '&paymentfailed=true');
